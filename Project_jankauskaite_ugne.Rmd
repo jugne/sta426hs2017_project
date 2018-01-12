@@ -1,0 +1,719 @@
+---
+title: "Differential Expression Analysis of mRNA-seq Data from Single Cell and Circulating Tumor Cells "
+author: "Ugne Jankauskaite"
+date: "January 10, 2018"
+output:
+  pdf_document: 
+    keep_tex: yes
+header-includes: \usepackage{color}
+urlcolor: blue
+bibliography: references.bib
+---
+
+
+This project aims to reproduce results published in @ramskold2012full study [Full-length mRNA-Seq from single-cell levels of RNA and individual circulating tumor cells](https://www.nature.com/articles/nbt.2282). The scope of this project is smaller than work done in the original paper. One of the main goals of Ramskold *et al.* study was to provide evidence that (at the time) newly created mRNA sequencing protocol (Smart-Seq) was robust and applicable to single-cell level. For this purpose they also conducted differential gene expression analysis for single cell and circulating tumor cells data.
+The goal of this project is to reproduce the aforementioned differential expression analysis.
+
+## Methods
+
+All work was done using Linux operating system.
+
+### Alignment And Reads Count
+
+Alignment and reads counting require a lot of resources and therefore were done outside of RStudio. Simple bash scripts bowtie.sh and rpkm.sh scripts for alignment and reads counting can be found in the same git repository. Before running all the tools mentioned below have to be installed and placed in the same directory. Raw fastq file were obtained following original article's GEO accession number GSE38495 from (European Nucleotide Archive (ENA)](http://www.ebi.ac.uk/ena).
+
+* For sequence alignment [Bowtie](http://bowtie-bio.sourceforge.net/index.shtml) software was used. It was selected to match the article as well as for clear way to specify running a task on multiple cores. For indexing, pre-built index H. sapiens UCSC hg19  was used (available on [bowtie manual page](http://bowtie-bio.sourceforge.net/manual.shtml)). The -m flag was used to ensure that mapping is unique. This is done to get unique mapping SAM files which were the authors’ input to the subsequent pipeline steps. Typical command used:
+
+> bowtie --threads 6 -m 1 -S hg19 -q input.fastq >  output.sam
+
+* Raw reads and Reads Per Kilobase per Million mapped reads ([RPKM](https://wiki.nci.nih.gov/pages/viewpage.action?pageId=71439191)) values were obtained by the python script [rpkmforgenes.py](http://sandberg.cmb.ki.se/media/data/rnaseq/instructions-rpkmforgenes.html) which was developed by the authors during previous studies for gene expression quantification in RNA-Seq data. The script allows non-uniquely mapped reads, but this option uses a lot of memory and exceeds my workstation capabilities (8 RAM). For annotation hg19 refGene.txt (RefSeq) file from [UCSC database](http://hgdownload.cse.ucsc.edu/goldenpath/hg19/database/) was used. The output is written as a plain text file and contains of four columns: “Gene ID”, “Refseq ID”, “RPKM” and “Reads”. Typical command used:
+
+> python2.7 rpkmforgenes.py -i input.sam -readcount -fulltranscript -mRNAnorm -samse -a refGene.txt -p 20 -sortpos -o output.RPKM.txt
+
+File refGene.txt can be downloaded as follows:
+
+```{r eval=FALSE}
+#refGene
+print(paste("hg19 reference downloaded on ", Sys.Date()))
+refGene.name <- paste0("refGene_",Sys.Date(),".txt")
+refGene.name_zip <- paste0(refGene.name, ".zip")
+url_hg19 <- "http://hgdownload.cse.ucsc.edu/goldenPath/hg19/database/refGene.txt.gz"
+utils::download.file(url_hg19, destfile=refGene.name_zip, mode="wb")
+R.utils::gunzip(refGene.name_zip, destname=refGene.name, overwrite=TRUE)
+```
+
+### Differential Expression
+
+* For differential gene expression analysis classic one-way ANOVA test is used. To avoid false positive p-values, they are adjusted with Benjamin-Hochberg (BH) method and reported as q (adjusted p) values. Then Tukey post-hoc test is used to identify pairs of samples which means are significantly different. For all pairs, genes are considered differentially expressed if their BH adjusted ANOVA p-value (q) and Tukey p-value are below 0.05.
+
+* For hierarchical clustering analysis only highly expressed genes were selected (at least 100 RPKM in any sample). Clusters were based on dissimilarity measure obtained from Spearman correlation. For each cluster p-values were obtained by multi-scale bootstrap resampling. For this [pvclust](http://stat.sys.i.kyoto-u.ac.jp/prog/pvclust/) R package was used, which provides two types of p values: 
+
+> \textcolor{red}{AU} (Approximately Unbiased) p-value and \textcolor{green}{BP} (Bootstrap Probability) value. AU p-value, which is computed by multiscale bootstrap resampling, is a better approximation to unbiased p-value than BP value computed by normal bootstrap resampling.
+
+* Principal Component Analysis was performed with function prcomp from stats R package which, rather than  [SVDMAN](https://www.ncbi.nlm.nih.gov/pubmed/11395437) tool used by Ramskold *et al.*
+
+## Biological setting
+
+Firstly, single-cell transcriptomes from prostate and bladder cancer cells are used. This is to ensure that data obtained with newly proposed Smart-Seq protocol is usable for differential expression analysis and cell lineage identification.
+
+Secondly, differential expression of circulating tumor cells (CTC) versus primary melanocytes (PM), melanoma cancer cells (SKMEL5, UACC257), embrionic stem cells (ESC), white blood cells (WB) and Burkitt's lymphoma cells are studied. The goal is to show that after Smart-Seq application, CTC can be identified by several marker genes with high precision. Possibility of better CTC detection is of special interest because they are associated with tumor metastasis. As @plaks2013circulating explains in their [article](http://science.sciencemag.org/content/341/6151/1186.long):
+
+> Because dissemination mostly occurs through the blood, circulating tumor cells (CTCs) that have been shed into the vasculature and may be on their way to potential metastatic sites are of obvious interest.
+
+Immune cells are used for comparison, since CTC are extracted from blood circulation.
+
+## Data Analysis
+
+### Data Donwload and Preparation
+
+Load all required libraries:
+
+```{r  warning=FALSE, message=FALSE}
+library(tools)
+library(ppls)
+library(tibble)
+library(pvclust)
+library(dendextend)
+library(gplots)
+library(XLConnect)
+library(data.table)
+library(knitr)
+library(kableExtra)
+```
+
+Set directory, where all needed files will be stored. By default, this should be the directory of the R markdown source file.
+
+```{r }
+# Setting working directory to source file directory. Works on RStudio.
+knitr::opts_knit$set(root.dir = getwd())
+workdir <- getwd()
+data_dir = paste0(getwd(), "/data")
+```
+
+Counts data can also be downloaded here (in this study, using the reproduced data from raw fastq files).
+
+```{r  download_main_data, eval=FALSE}
+url_main <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE38495&format=file"
+utils::download.file(url, destfile="GSE38495_RAW.tar", mode="wb") 
+```
+
+Extract pre-processed data into the data directory
+
+```{r }
+utils::untar("data_from_raw.tar", exdir = data_dir)
+```
+
+From extracted files, identify files for each cell line:
+
+```{r }
+# NG2+ putative melanoma CTC (Circulating melanoma cell)
+CTC.list_files = list.files(path = data_dir, pattern = "*CTC_RPKM*")
+CTC.num_files = length(CTC.list_files)
+# WB - white blood cells
+WB.list_files = list.files(path = data_dir, pattern = "*Whitebloodcell_[0-9]_RPKM*")
+WB.num_files = length(WB.list_files)
+# BL - Burkitt's lymphoma cells
+BL.list_files = list.files(path = data_dir, pattern = "*GSM78215[1-9]_BL*")
+BL.num_files = length(BL.list_files)
+# PM - primary melanocytes
+PM.list_files = list.files(path = data_dir, pattern = "*pm_RPKM*")
+PM.num_files = length(PM.list_files)
+# SKMEL5
+SKMEL.list_files = list.files(path = data_dir, pattern = "*SKMEL5_cell[0-9]_RPKM*")
+SKMEL.num_files = length(SKMEL.list_files)
+#UACC257
+UACC.list_files = list.files(path = data_dir, pattern = "*UACC257_cell[0-9]_RPKM*")
+UACC.num_files = length(UACC.list_files)
+# ESCs
+ESC.list_files = list.files(path = data_dir, pattern = "*hESC_RPKM*")
+ESC.num_files = length(ESC.list_files)
+
+#T24
+T24.list_files = list.files(path = data_dir, pattern = "*[T,t]24-1[0-9]_RPKM*")
+T24.num_files = length(T24.list_files)
+#Lncap
+Lncap.list_files = list.files(path = data_dir, pattern = "*Lncap-1[0-9]_RPKM*")
+Lncap.num_files = length(Lncap.list_files)
+#PC3
+PC3.list_files = list.files(path = data_dir, pattern = "*[P,p][C,c]3-1[0-9]_RPKM*")
+PC3.num_files = length(PC3.list_files)
+
+all_files = c(CTC.list_files, PM.list_files, SKMEL.list_files, UACC.list_files,
+              ESC.list_files, Lncap.list_files, PC3.list_files,
+              T24.list_files, WB.list_files, BL.list_files)
+```
+
+<!-- Unzip RPKM and reads count files: -->
+
+<!-- ```{r } -->
+<!-- for(i in paste0(data_dir, "/", all_files, ".gz")) -->
+<!--   R.utils::gunzip(i, overwrite=TRUE) -->
+<!-- ``` -->
+
+Data files contain duplicate rows (which might be a bug in the rpkmforgenes.py script). For example, first five repetitive lines and their repetition count can be printed using the following command:
+
+```{r  }
+cmd = paste0("sort ", data_dir, "/", all_files[1], " | uniq -cd | tail -n +5 |  head -5")
+system(cmd)
+```
+
+The following code removes them from the list of files.
+
+```{r }
+removeDuplicates <- function(pathToFile){
+  file = readLines(pathToFile,-1)
+  x <- read.table(pathToFile, header=FALSE, sep="\t", comment.char = "#", check.names = FALSE)
+  # To check which lines were removed, uncomment line below before running.
+  # print(x[duplicated(x[,1]),])
+  y <- x[!duplicated(x[,1]),]
+  write.table(y, pathToFile, sep="\t",row.names=FALSE, quote = FALSE, col.names = FALSE)
+}
+
+for (i in 1:length(all_files)){
+  pathToFile = paste0(data_dir, "/", all_files[i])
+  removeDuplicates(pathToFile)
+}
+```
+
+Create a grouping variable, in which sample information is discarded and only cell line name is maintained:
+
+```{r }
+group <- as.factor(c(rep("CTC", CTC.num_files), rep("PM", PM.num_files),
+                     rep("SKMEL", SKMEL.num_files), rep("UACC", UACC.num_files),
+                     rep("ESC", ESC.num_files), rep("Lncap", Lncap.num_files),
+                     rep("PC3", PC3.num_files), rep("T24", T24.num_files),
+                     rep("WB", WB.num_files), rep("BL", BL.num_files)))
+```
+
+Create a data frame of gene RPKM counts for all samples:
+
+```{r }
+num_files = length(all_files)
+cell_names <- vector(mode="character", length=num_files)
+for (i in 1:num_files){
+  path=paste0(data_dir, "/", all_files[i])
+  cell_names[i] <- substr(all_files[i],11,nchar(all_files[i])-9)
+  sample_data <- read.table(path, header=FALSE, sep="\t", stringsAsFactors=FALSE)
+  colnames(sample_data) <- c("Gene.symbol","Refseq.ID", "RPKM.FPKM", "reads")
+  if (i!=1){
+    data.RPKM <- cbind(data.RPKM, sample_data$RPKM.FPKM)
+    colnames(data.RPKM)[i+1] = cell_names[i]
+    next
+  }
+  else{data.RPKM <- data.frame(sample_data$Gene.symbol, sample_data$RPKM.FPKM)
+  colnames(data.RPKM)[1] <- "Gene"
+  colnames(data.RPKM)[2] <- cell_names[1]
+  }
+}
+```
+
+
+### Differenial Expression Analysis of 12 Single Cell Samples
+
+Firstly, 12 single cell cancer samples are separated from the rest data.
+
+```{r }
+data.RPKM_12cancer <- data.frame(data.RPKM$Gene, data.RPKM[,25:36])
+dim(data.RPKM_12cancer)
+```
+
+#### Principal Component Analysis
+
+Principal component analysis shows clear separation between three single cell groups. While the separation is as seen in Ramskold *et al.* study (**figure 3a**), the exact values of principal components seem to be slightly different (not possible to compare exact numbers as they are not reported by the authors). In general, the original paper figure shows that PC1 and PC2 values for T24 are smaller, while values for Lncap are bigger and more closely clustered than shown in the plot below.
+
+```{r }
+temp_data<- data.frame(scale(t(data.RPKM_12cancer[c(2:13)])))
+# remove genes with NAN values in all samples (no measurements, no variance change)
+bad <- sapply(temp_data, function(x) all(is.nan(x)))
+temp_data<-temp_data[,!bad]
+prc <- prcomp(temp_data, scale. = F, center = F)
+plot(-prc$x[,1:2], main="PCA for single cell data", col=factor(group[24:35]),
+     pch=16, xlim=c(-100,150), ylim=c(-100,150))
+legend("topright", legend=levels(factor(group[24:35])), pch=16,
+       col=unique(factor(group[24:35])))
+```
+
+```{r  echo=FALSE}
+remove(temp_data)
+```
+
+
+#### One-way ANOVA Test
+
+
+
+A shift of one (to avoid log(0)) is applied and log2 of RPKM counts taken for easier calculation and imaging.
+
+```{r }
+data.RPKM_12cancer[,2:13] <- log2(data.RPKM_12cancer[,2:13]+1)
+```
+
+
+Then we can perform one-way ANOVA test with Benjamin-Hochberg p-value adjustment and post-hoc Tukey test.
+
+1. Create some helper variables
+
+```{r }
+# threshold p-value
+p_t=0.05
+# some helper data frames for data separation and storage
+PC3vsLncap = data.frame(Gene=character(),  p.Tukey=double(), stringsAsFactors=FALSE)
+T24vsLncap = data.frame(Gene=character(),  p.Tukey=double(), stringsAsFactors=FALSE)
+T24vsPC3 = data.frame(Gene=character(),  p.Tukey=double(), stringsAsFactors=FALSE)
+ANOVA=data.frame(Gene=character(), p=double(), q=double())
+```
+
+2. Run one-way ANOVA and Tukey post-hoc
+
+```{r }
+tmydf = setNames(data.frame(t(data.RPKM_12cancer[,-1])), data.RPKM_12cancer[,1])
+s<-data.frame(CellType=factor(c(rep("Lncap", Lncap.num_files),
+                     rep("PC3", PC3.num_files), rep("T24", T24.num_files))), tmydf)
+num_genes = dim(s)[2]
+for (i in 2:num_genes){
+  geneCounts <- s[,i]
+  geneName <- names(s[i])
+  model<-lm(geneCounts~s$CellType)
+  an <- anova(model)
+  an.p <- an$`Pr(>F)`[1]
+  ANOVA = rbind(ANOVA, data.frame(Gene=geneName, p=an.p))
+
+  posthoc <- TukeyHSD(aov(geneCounts~s$CellType))
+  for (j in 1:3) {
+    tukey.p <- posthoc$`s$CellType`[j,4]
+    rowName = rownames(posthoc$`s$CellType`)[j]
+    if (identical(rowName,"PC3-Lncap")){
+      PC3vsLncap = rbind(PC3vsLncap, data.frame(Gene=geneName, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"T24-Lncap")){
+       T24vsLncap = rbind(T24vsLncap, data.frame(Gene=geneName, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"T24-PC3")){
+       T24vsPC3 = rbind(T24vsPC3, data.frame(Gene=geneName, p.Tukey=tukey.p))
+    }
+  }
+}
+```
+
+
+Number of genes with unadjusted ANOVA p-values less than 0.05:
+
+```{r  echo=FALSE}
+#number of ANOVA p values which are less than 0.05
+length(which(ANOVA$p < p_t))
+```
+
+3. Benjamin-Hochberg ANOVA p-value adjustment
+
+```{r }
+#Use BH to adjust p values
+ANOVA$q <- p.adjust(ANOVA$p, method = "BH")
+```
+
+Number of genes with BH adjusted ANOVA p-value (q) less than 0.05:
+
+```{r  echo=FALSE}
+#number of ajusted ANOVA p values which are less than 0.05
+length(which(ANOVA$q < p_t))
+```
+
+Add newly calculated p values to the dataframe:
+
+```{r }
+data.RPKM_12cancer$p.ANOVA <- ANOVA$p
+data.RPKM_12cancer$q.ANOVA <- ANOVA$q
+data.RPKM_12cancer$PC3vsLncap.p.Tukey <- PC3vsLncap$p.Tukey
+data.RPKM_12cancer$T24vsLncap.p.Tukey <- T24vsLncap$p.Tukey
+data.RPKM_12cancer$T24vsPC3.p.Tukey <- T24vsPC3$p.Tukey
+```
+
+
+
+Genes are considered differentially expressed between two types of cells if both BH adjusted ANOVA p-value (q) and Tukey p value are smaller than 0.05.
+
+```{r }
+id.de_PC3vsLncap <- which(data.RPKM_12cancer$q.ANOVA < p_t &
+                            data.RPKM_12cancer$PC3vsLncap.p.Tukey < p_t)
+id.de_T24vsLncap <- which(data.RPKM_12cancer$q.ANOVA < p_t &
+                            data.RPKM_12cancer$T24vsLncap.p.Tukey < p_t)
+id.de_T24vsPC3 <- which(data.RPKM_12cancer$q.ANOVA < p_t &
+                          data.RPKM_12cancer$T24vsPC3.p.Tukey < p_t)
+```
+
+
+Number of DE genes between PC3 and Lncap cells:
+
+```{r  echo=FALSE}
+length(id.de_PC3vsLncap)
+```
+
+Number of DE genes between T24 and Lncap cells:
+
+```{r  echo=FALSE}
+length(id.de_T24vsLncap)
+```
+
+Number of DE genes between T24 and PC3 cells:
+
+```{r  echo=FALSE}
+length(id.de_T24vsPC3)
+```
+
+The number of pairwise differentially expressed genes are higher than in the original publication. However, proportional relationship is maintained.
+
+
+### Differenial Expression Analysis of Circulating Tumor Transcriptomes
+
+
+
+Circulating tumor samples samples are separated from the rest data. Shift of 1 and log2 is applied to RPKM counts.
+
+```{r }
+data.RPKM_tumor<-data.frame(Genes=data.RPKM$Gene, log2(data.RPKM[,2:16]+1))
+dim(data.RPKM_tumor)
+```
+
+
+#### One-way ANOVA Test
+
+Then we can perform one-way ANOVA test with Benjamin-Hochberg p-value adjustment and post-hoc Tukey test. Since calculations are equivalent to the ones for 12 single cell data, they are excluded from PDF report file. To see the code please refer to the R markdown file.
+
+```{r  echo=FALSE}
+p_t=0.05 #threshold for p value
+
+# Helper variables
+ANOVA2 <- data.frame(Gene=character(), p=double(), q=double())
+PMvsCTC = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+SKMELvsCTC  = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+UACCvsCTC = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+SKMELvsPM = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+UACCvsPM = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+UACCvsSKMEL = data.frame(Gene=character(), p.Tukey=double(), stringsAsFactors=FALSE)
+
+# One-way ANOVA and Tukey test
+tmydf <- setNames(data.frame(t(data.RPKM_tumor[,-1])), data.RPKM_tumor[,1])
+s<-data.frame(CellType=factor(c(rep("CTC", CTC.num_files), rep("PM", PM.num_files), rep("SKMEL", SKMEL.num_files), rep("UACC", UACC.num_files))), tmydf)
+num_genes = dim(s)[2]
+for (i in 2:num_genes){
+  geneCounts <- s[,i]
+  geneName <- names(s[i])
+  model<-lm(geneCounts~s$CellType)
+  an <- anova(model)
+  an.p <- an$`Pr(>F)`[1]
+  ANOVA2 = rbind(ANOVA2, data.frame(Gene=geneName, p=an.p))
+
+  posthoc <- TukeyHSD(aov(geneCounts~s$CellType))
+  for (j in 1:6) {
+    tukey.p <- posthoc$`s$CellType`[j,4]
+    rowName = rownames(posthoc$`s$CellType`)[j]
+    if (identical(rowName,"PM-CTC")){
+      PMvsCTC <- rbind(PMvsCTC, data.frame(Gene=geneName, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"SKMEL-CTC")){
+      SKMELvsCTC <- rbind(SKMELvsCTC, data.frame(Gene=geneName, p.ANOVA=an.p, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"UACC-CTC")){
+      UACCvsCTC <- rbind(UACCvsCTC, data.frame(Gene=geneName, p.ANOVA=an.p, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"SKMEL-PM")){
+      SKMELvsPM <- rbind(SKMELvsPM, data.frame(Gene=geneName, p.ANOVA=an.p, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"UACC-PM")){
+      UACCvsPM <- rbind(UACCvsPM, data.frame(Gene=geneName, p.ANOVA=an.p, p.Tukey=tukey.p))
+    }
+    else if (identical(rowName,"UACC-SKMEL")){
+      UACCvsSKMEL <- rbind(UACCvsSKMEL, data.frame(Gene=geneName, p.ANOVA=an.p, p.Tukey=tukey.p))
+    }
+  }
+}
+
+# Adjusting p values with BH
+rownames(data.RPKM_tumor) <- data.RPKM_tumor[,1]
+data.RPKM_tumor<-data.RPKM_tumor[,-1]
+```
+
+
+The number of genes for which ANOVA p-values are less then 0.05 is:
+
+```{r  echo=FALSE}
+length(which(ANOVA2$p < p_t))
+```
+
+Number of genes with BH adjusted ANOVA p-value (q) less than 0.05:
+
+```{r  echo=FALSE}
+ANOVA2$q <- p.adjust(ANOVA2$p, method = "BH")
+ids2 <- which(ANOVA2$q < p_t)
+length(ids2)
+```
+
+
+```{r  echo=FALSE}
+# Add new data to the dataframe
+
+data.RPKM_tumor$p.ANOVA <- ANOVA2$p
+data.RPKM_tumor$q.ANOVA <- ANOVA2$q
+remove(ANOVA2)
+
+data.RPKM_tumor$PMvsCTC.p.Tukey <- PMvsCTC$p.Tukey
+data.RPKM_tumor$SKMELvsCTC.p.Tukey <- SKMELvsCTC$p.Tukey
+data.RPKM_tumor$UACCvsCTC.p.Tukey <- UACCvsCTC$p.Tukey
+data.RPKM_tumor$SKMELvsPM.p.Tukey <- SKMELvsPM$p.Tukey
+data.RPKM_tumor$UACCvsPM.p.Tukey <- UACCvsPM$p.Tukey
+data.RPKM_tumor$UACCvsSKMEL.p.Tukey <- UACCvsSKMEL$p.Tukey
+```
+
+  
+Now, we can obtain number of genes that are differentially expressed between primary melanocytes and circulating tumor cells:
+
+```{r }
+id.de_PMvsCTC <- which(data.RPKM_tumor$q.ANOVA < p_t &
+                         data.RPKM_tumor$PMvsCTC.p.Tukey < p_t)
+length(id.de_PMvsCTC)
+```
+
+Number of genes that are upregulated in putative CTCs in comparison to primary melanocytes and first rows of these genes expression data:
+
+```{r echo=FALSE}
+id.de_PMvsCTC_high <- which(rowMeans(data.RPKM_tumor[id.de_PMvsCTC,1:6]) >
+                              rowMeans(data.RPKM_tumor[id.de_PMvsCTC,7:8]))
+length(id.de_PMvsCTC_high)
+d <- head(data.RPKM_tumor[id.de_PMvsCTC[id.de_PMvsCTC_high], c(1:6, 7:8, 16:18)])
+colnames(d) <- c("CTC1", "CTC2", "CTC3", "CTC4", "CTC5", "CTC6", "PM1", "PM2",
+                 "p.ANOVA", "q.ANOVA", "PMvsCTC.p.Tukey")
+kable(d, format = "latex", booktabs = T) %>% 
+  kable_styling (latex_options = c ("striped", "scale_down"))
+
+```
+
+
+Number of genes that are downregulated in putative CTCs in comparison to primary melanocytes and first rows of these genes expression data:
+
+```{r echo=FALSE}
+id.de_PMvsCTC_low <- which(rowMeans(data.RPKM_tumor[id.de_PMvsCTC,1:6]) <
+                             rowMeans(data.RPKM_tumor[id.de_PMvsCTC,7:8]))
+length(id.de_PMvsCTC_low)
+d <- head(data.RPKM_tumor[id.de_PMvsCTC[id.de_PMvsCTC_low], c(1:6, 7:8, 16:18)])
+colnames(d) <- c("CTC1", "CTC2", "CTC3", "CTC4", "CTC5", "CTC6", "PM1", "PM2",
+                 "p.ANOVA", "q.ANOVA", "PMvsCTC.p.Tukey")
+kable(d, format = "latex", booktabs = T) %>% 
+  kable_styling (latex_options = c ("striped", "scale_down"))
+```
+
+#### Hierarchial  Clustering
+
+As in the original paper, hierarchical clustering was performed only for genes for which at least one sample had a high expression value (RPKM > 100).
+
+```{r }
+# Rearange data
+row_names <- data.RPKM[,1]
+data.RPKM <- data.RPKM[,-1]
+rownames(data.RPKM) <- row_names
+print(paste0("Original data gene count: ", dim(data.RPKM)[1]))
+
+# get highly expressed genes
+data.RPKM_high <- data.RPKM[apply(data.RPKM[,-1], 1, function(row) {any(row > 100)}), ]
+colnames(data.RPKM_high) <- group
+print(paste0("Gene count for genes with RPKM > 100: ", dim(data.RPKM_high)[1]))
+```
+
+
+
+
+To cluster data, dissimilarity distance is calculated based on Spearman correlation and 1000 bootstrapped samples added.
+
+```{r  message=FALSE, warning=FALSE}
+spearman <- function(x, ...) {
+    x <- as.matrix(x)
+    res <- as.dist(1 - cor(x, method = "spearman", use = "everything"))
+    res <- as.dist(res)
+    attr(res, "method") <- "spearman"
+    return(res)
+}
+data.RPKM_high <- data.RPKM_high[, ! apply(data.RPKM_high , 2 ,
+                                           function(x) sd(x, na.rm = TRUE)==0 ) ]
+cluster.bootstrap <- pvclust(data.RPKM_high, parallel = TRUE, nboot = 1000,
+                             method.dist=spearman)
+```
+
+In the plot below, \textcolor{red}{AU} (Approximately Unbiased) p-value and \textcolor{green}{BP} (Bootstrap Probability) value are as described in the Methods section.
+Red rectangles marks clusters with high AU values (95%).
+
+```{r  fig.height = 6, fig.width = 10}
+dend <- as.dendrogram(cluster.bootstrap)
+dend <- color_branches(dend, 4)
+
+dend %>% as.dendrogram %>%
+   plot(main = "Cluster dendrogram with AU/BP values (%)\n
+        reproduced plot with dendrogram",
+        ylab = "1 - Spearman correlation")
+cluster.bootstrap %>% text(cex=0.6)
+cluster.bootstrap %>% pvrect(alpha=0.95, pv="au", type="geq")
+```
+
+Overall, all cells clustered within their cell lines with high AU p-value. Burkitt's lymphoma samples are clearly separated from prostate and bladder single cell samples, primary melanocytes, melanoma cancer cell line and embryonic stem cell samples. All the rest samples make expected clusters with samples of similar cell lines, importantly CTC are in the same cluster as PM, SKMEL and UACC cells.
+
+
+
+##### Heatmap Comparison of Gene Expression
+
+
+
+For the heatmaps, the data shift value before taking a logarithm of the data was not stated in the original paper. However, since heatmaps in **figures 4b-4f** of the paper include negative logarithm values, here the applied shift is chosen so be smaller then one:
+
+```{r }
+data.RPKM_log <- log2(data.RPKM+0.1)
+```
+
+
+In **figure 4b** and **supplementary figure 9** Ramskold *et al.* used known NG2+ CTC marker genes PMEL, MITF, TYR, MLANA and known immune marker genes PTPRC, CD53, CCL5 to show that CTCs are of melanocytic origin and not immune origin. These results are accurately reproduced in the figure below:
+
+```{r  fig.height = 4, fig.width = 10}
+cols <- c(1:23, 36:39)
+data.RPKM_h1 <- rbind(data.RPKM_log["PMEL", cols], data.RPKM_log["MITF", cols],
+                      data.RPKM_log["TYR", cols], data.RPKM_log["MLANA", cols],
+                      data.RPKM_log["PTPRC", cols], data.RPKM_log["CD53", cols],
+                      data.RPKM_log["CCL5", cols])
+colnames(data.RPKM_h1) <- group[cols]
+
+heatmap.2(as.matrix(data.RPKM_h1), dendrogram = "none", Colv=FALSE, Rowv = FALSE,
+          tracecol = NA, col=colorRampPalette(c("white", "red")),
+          breaks=c(1:0.5:10), density.info="none", key.xlab = "RPKM log2", cexRow = 1)
+```
+
+
+Then, in order to further compare primary melanocytes and CTCs, the authors showed that melanoma-associated tumor antigens are upregulated in CTC samples, compared to PM samples. These results were reproduced in the figure below:
+
+```{r  fig.height = 4, fig.width = 11}
+cols <- c(1:23, 36:39)
+data.RPKM_h2 <- rbind(data.RPKM_log["MAGEB2", cols], data.RPKM_log["MAGEC2", cols],
+                      data.RPKM_log["MAGEA10", cols], data.RPKM_log["MAGEA2", cols],
+                      data.RPKM_log["CSAG4+MAGEA12", cols], data.RPKM_log["MAGEA6", cols],
+                      data.RPKM_log["MAGEA3", cols])
+colnames(data.RPKM_h2) <- group[cols]
+
+heatmap.2(as.matrix(data.RPKM_h2), dendrogram = "none", Colv=FALSE, Rowv = FALSE,
+          tracecol = NA, col=colorRampPalette(c("blue", "white", "red")),
+          breaks=c(-5:5), key=TRUE, symkey=FALSE, density.info="none",
+          key.xlab = "RPKM log2", cexRow = 1,margins=c(5,18))
+```
+
+Data table of these genes expression for CTC and PM samples shows clear differential expression with significant one-way ANOVA p-values, BH adjusted q-values, and Tukey post-hoc test p-values for all antigens, except MAGEA2+MAGEA2B:
+
+```{r echo=FALSE}
+cols <- c(1:6, 7:8, 16:18)
+d <- rbind(data.RPKM_tumor["MAGEB2", cols], data.RPKM_tumor["MAGEC2", cols],
+      data.RPKM_tumor["MAGEA10", cols], data.RPKM_tumor["MAGEA2", cols],
+      data.RPKM_tumor["CSAG4+MAGEA12", cols], data.RPKM_tumor["MAGEA6", cols],
+      data.RPKM_tumor["MAGEA3", cols])
+colnames(d) <- c("CTC1", "CTC2", "CTC3", "CTC4", "CTC5", "CTC6", "PM1", "PM2",
+                 "p.ANOVA", "q.ANOVA", "PMvsCTC.p.Tukey")
+kable(d, format = "latex", booktabs = T) %>%
+  kable_styling (latex_options = c ("striped", "scale_down"))
+```
+
+
+
+
+Further nine plasma-membrane associated transcripts were identified in CTC compared to PM in the **figure 4e** of the original paper. However, here the authors results are not reproduce completely. The heatmap below shows that two of the nine transcripts - RPS3 and PSMB1 - were also highly expressed in PM cells.
+
+
+```{r fig.height = 4, fig.width = 9}
+cols <- c(1:23, 36:39)
+data.RPKM_h3 <- rbind(data.RPKM_log["GJB1", cols], data.RPKM_log["LL22NC03-63E9.3+PRAME", cols],
+                      data.RPKM_log["ADGRG6", cols], data.RPKM_log["CRIM1", cols],
+                      data.RPKM_log["ABCG5", cols], data.RPKM_log["SLC20A1", cols],
+                      data.RPKM_log["ADAM17", cols], data.RPKM_log["RPS3", cols],
+                      data.RPKM_log["PSMB1", cols])
+colnames(data.RPKM_h3) <- group[cols]
+
+library(gplots)
+heatmap.2(as.matrix(data.RPKM_h3), dendrogram = "none", Colv=FALSE, Rowv=FALSE,
+          tracecol = NA, col=colorRampPalette(c("blue", "white", "red")),
+          breaks=c(-10:10), key=TRUE, symkey=FALSE, density.info="none",
+          key.xlab = "RPKM log2", cexRow = 1, margins=c(5,18))
+```
+
+Furthermore, comparing the authors data from Supplementary Table 4 to data generated during this project, very similar results can be observed for the nine genes (small differences may be due to different shift before applying log2). It can be seen that genes RPS3 and PSMB1 are quite highly expressed in PM according to the authors data, however in the **figure 4e** of the paper the expression is shown as very small.
+
+* Data for 9 genes by Ramskold *et al.*:
+
+```{r echo=FALSE}
+wb <- loadWorkbook(paste0(workdir, "/nbt.2282-S5.xls"))
+authorsData <- readWorksheet(wb, sheet = "Sheet1") 
+authorsData <- authorsData[-(1:4), ]
+colnames(authorsData) <- authorsData[1, ]
+rownames(authorsData) <- authorsData[,1]
+authorsData <- authorsData[-1,-1]
+```
+
+```{r echo=FALSE}
+kable(rbind(authorsData["GJB1", ], authorsData["PRAME", ],
+            authorsData["GPR126", ], authorsData["CRIM1", ],
+            authorsData["ABCG5", ], authorsData["SLC20A1", ],
+            authorsData["ADAM17", ], authorsData["RPS3", ],
+            authorsData["PSMB1", ]), format = "latex", booktabs = T) %>%
+  kable_styling (latex_options = c ("striped", "scale_down"))
+```
+
+* Data for 9 genes generated during this project:
+
+```{r echo=FALSE}
+cols <- c(1:23)
+d <- rbind(data.RPKM_tumor["GJB1", cols], data.RPKM_tumor["LL22NC03-63E9.3+PRAME", cols],
+      data.RPKM_tumor["ADGRG6", cols], data.RPKM_tumor["CRIM1", cols],
+      data.RPKM_tumor["ABCG5", cols], data.RPKM_tumor["SLC20A1", cols],
+      data.RPKM_tumor["ADAM17", cols], data.RPKM_tumor["RPS3", cols],
+      data.RPKM_tumor["PSMB1", cols])
+colnames(d) <- c("CTC1", "CTC2", "CTC3", "CTC4", "CTC5", "CTC6", "PM1", "PM2",
+                 "SKMEL1", "SKMEL2", "SKMEL3", "SKMEL4", "UACC1", "UACC2", "UACC3", 
+                 "p.ANOVA", "q.ANOVA", "PMvsCTC.p.Tukey", "SKMELvsCTC.p.Tukey",
+                 "UACCvsCTC.p.Tukey", "SKMELvsPM.p.Tukey", "UACCvsPM.p.Tukey", "UACCvsSKMEL.p.Tukey")
+kable(d, format = "latex", booktabs = T) %>%
+  kable_styling (latex_options = c ("striped", "scale_down"))
+```
+
+
+
+Finally, loss of expression in plasma-membrane proteins in CTCs was investigated by the authors. The loss of membrane proteins makes cells less visible for the immune system, thus can escape control, drift to different regions of the body and cause metastasis. Figure shows 37 plasma membrane proteins which are , as expected, highly downregulated in CTCs:
+
+```{r  fig.height = 7, fig.width = 8}
+cols <- c(1:23, 36:39)
+data.RPKM_h4 <- rbind(data.RPKM_log["GPR143", cols], data.RPKM_log["SEMA5A", cols],
+                      data.RPKM_log["ABCB5", cols], data.RPKM_log["TRPM1", cols],
+                      data.RPKM_log["TGFB1I1", cols], data.RPKM_log["PLIN2", cols],
+                      data.RPKM_log["SLC16A6", cols], data.RPKM_log["MGST2", cols],
+                      data.RPKM_log["SLC7A8", cols], data.RPKM_log["CDH1", cols],
+                      data.RPKM_log["DPP4", cols], data.RPKM_log["RAB31", cols],
+                      data.RPKM_log["CYSLTR2", cols], data.RPKM_log["GNAL", cols],
+                      data.RPKM_log["IFITM2", cols], data.RPKM_log["HLA-G", cols],
+                      data.RPKM_log["HLA-H", cols], data.RPKM_log["HLA-C", cols],
+                      data.RPKM_log["HLA-B", cols], data.RPKM_log["TTYH3", cols],
+                      data.RPKM_log["HDAC6", cols], data.RPKM_log["HRAS", cols],
+                      data.RPKM_log["APP", cols], data.RPKM_log["DSG2", cols],
+                      data.RPKM_log["NF2", cols], data.RPKM_log["ANXA6", cols],
+                      data.RPKM_log["CD81", cols], data.RPKM_log["VAMP8", cols])
+colnames(data.RPKM_h4) <- group[cols]
+
+heatmap.2(as.matrix(data.RPKM_h4), dendrogram = "none", Colv=FALSE, Rowv=FALSE,
+          tracecol = NA, col=colorRampPalette(c("blue", "white", "red")),
+          breaks=c(-8:8), key=TRUE, symkey=FALSE, density.info="none",
+          key.xlab = "RPKM log2", cexRow = 1)
+```
+
+
+## Discussion
+
+The main goal of this project was to apply methods learned during the course and reproduce real research results. Quantitatively, results were not always exactly matching those of the selected paper (PCA analysis for 12 cancer single sell samples, exact number of differentially expressed genes between pairs of samples). This, among other reasons, might happen due to updated reference files  I used for alignment and counting reads. Some small differences might also happen because of different shift value when taking a logarithm. However, with one exception the qualitative results of the original paper and this study were the same. The reason of different qualitative results in expression data heatmap of nine plasma membrane associated genes is unclear as the exact numbers provided by authors in **supplementary table 4** agree with the expression data obtained by this study.  
+Furthermore, in the future I would prefer using a different read counts expression than RPKM. Doing the research for this project, I found that RPKM were criticized by many researchers, see, for example @wagner2012measurement. Also, it would be interesting to apply negative binomial based models to the same raw counts data.
+
+
+
+# References
+
+  
+  
+
+
+
+
